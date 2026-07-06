@@ -1,188 +1,297 @@
-# Rust coding guidelines
+# Zdroid — Repository Guidelines
 
-* Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
-* Do not write organizational or comments that summarize the code. Comments should only be written in order to explain "why" the code is written in some way in the case there is a reason that is tricky / non-obvious.
-* Prefer implementing functionality in existing files unless it is a new logical component. Avoid creating many small files.
-* Avoid using functions that panic like `unwrap()`, instead use mechanisms like `?` to propagate errors.
-* Be careful with operations like indexing which may panic if the indexes are out of bounds.
-* Never silently discard errors with `let _ =` on fallible operations. Always handle errors appropriately:
-  - Propagate errors with `?` when the calling function should handle them
-  - Use `.log_err()` or similar when you need to ignore errors but want visibility
-  - Use explicit error handling with `match` or `if let Err(...)` when you need custom logic
-  - Example: avoid `let _ = client.request(...).await?;` - use `client.request(...).await?;` instead
-* When implementing async operations that may fail, ensure errors propagate to the UI layer so users get meaningful feedback.
-* Never create files with `mod.rs` paths - prefer `src/some_module.rs` instead of `src/some_module/mod.rs`.
-* When creating new crates, prefer specifying the library root path in `Cargo.toml` using `[lib] path = "...rs"` instead of the default `lib.rs`, to maintain consistent and descriptive naming (e.g., `gpui.rs` or `main.rs`).
-* Avoid creative additions unless explicitly requested
-* Use full words for variable names (no abbreviations like "q" for "queue")
-* Use variable shadowing to scope clones in async contexts for clarity, minimizing the lifetime of borrowed references.
-  Example:
-  ```rust
-  executor.spawn({
-      let task_ran = task_ran.clone();
-      async move {
-          *task_ran.borrow_mut() = true;
-      }
-  });
-  ```
+## 1. Project Overview
 
-# Timers in tests
+**Zdroid** is an independent Android port of [Zed](https://zed.dev), not affiliated with Zed Industries. Upstream's Editor, Workspace, Project, Search, GitGraph, Extensions, and Terminal crates run unchanged on a custom `gpui_android` platform backend. The project:
 
-* In GPUI tests, prefer GPUI executor timers over `smol::Timer::after(...)` when you need timeouts, delays, or to drive `run_until_parked()`:
-  - Use `cx.background_executor().timer(duration).await` (or `cx.background_executor.timer(duration).await` in `TestAppContext`) so the work is scheduled on GPUI's dispatcher.
-  - Avoid `smol::Timer::after(...)` for test timeouts when you rely on `run_until_parked()`, because it may not be tracked by GPUI's scheduler and can lead to "nothing left to run" when pumping.
+- Composits every pixel via Vulkan/wgpu through the Adreno Vulkan driver
+- Targets Android 9+ with a hardware keyboard (tablets, DeX, foldables)
+- Bundles a Termux-derived bootstrap userland (`com.zdroid`) for in-process subprocess execution
+- Offers three runtime adapters: **Bootstrap** (no root, Termux-derived apt/dpkg userland), **Kali chroot** (Magisk + `zd-spawnd` daemon for real glibc), and **External Termux** (JNI Intent bridge, currently stubbed)
+- Uses `cargo-ndk` for cross-compilation, Gradle for APK packaging
+- Licensed GPL-3.0-or-later (same as upstream Zed)
 
-# GPUI
-
-GPUI is a UI framework which also provides primitives for state and concurrency management.
-
-## Context
-
-Context types allow interaction with global state, windows, entities, and system services. They are typically passed to functions as the argument named `cx`. When a function takes callbacks they come after the `cx` parameter.
-
-* `App` is the root context type, providing access to global state and read and update of entities.
-* `Context<T>` is provided when updating an `Entity<T>`. This context dereferences into `App`, so functions which take `&App` can also take `&Context<T>`.
-* `AsyncApp` and `AsyncWindowContext` are provided by `cx.spawn` and `cx.spawn_in`. These can be held across await points.
-
-## `Window`
-
-`Window` provides access to the state of an application window. It is passed to functions as an argument named `window` and comes before `cx` when present. It is used for managing focus, dispatching actions, directly drawing, getting user input state, etc.
-
-## Entities
-
-An `Entity<T>` is a handle to state of type `T`. With `thing: Entity<T>`:
-
-* `thing.entity_id()` returns `EntityId`
-* `thing.downgrade()` returns `WeakEntity<T>`
-* `thing.read(cx: &App)` returns `&T`.
-* `thing.read_with(cx, |thing: &T, cx: &App| ...)` returns the closure's return value.
-* `thing.update(cx, |thing: &mut T, cx: &mut Context<T>| ...)` allows the closure to mutate the state, and provides a `Context<T>` for interacting with the entity. It returns the closure's return value.
-* `thing.update_in(cx, |thing: &mut T, window: &mut Window, cx: &mut Context<T>| ...)` takes a `AsyncWindowContext` or `VisualTestContext`. It's the same as `update` while also providing the `Window`.
-
-Within the closures, the inner `cx` provided to the closure must be used instead of the outer `cx` to avoid issues with multiple borrows.
-
-Trying to update an entity while it's already being updated must be avoided as this will cause a panic.
-
-`WeakEntity<T>` is a weak handle. It has `read_with`, `update`, and `update_in` methods that work the same, but always return an `anyhow::Result` so that they can fail if the entity no longer exists. This can be useful to avoid memory leaks - if entities have mutually recursive handles to each other they will never be dropped.
-
-## Concurrency
-
-All use of entities and UI rendering occurs on a single foreground thread.
-
-`cx.spawn(async move |cx| ...)` runs an async closure on the foreground thread. Within the closure, `cx` is `&mut AsyncApp`.
-
-When the outer cx is a `Context<T>`, the use of `spawn` instead looks like `cx.spawn(async move |this, cx| ...)`, where `this: WeakEntity<T>` and `cx: &mut AsyncApp`.
-
-To do work on other threads, `cx.background_spawn(async move { ... })` is used. Often this background task is awaited on by a foreground task which uses the results to update state.
-
-Both `cx.spawn` and `cx.background_spawn` return a `Task<R>`, which is a future that can be awaited upon. If this task is dropped, then its work is cancelled. To prevent this one of the following must be done:
-
-* Awaiting the task in some other async context.
-* Detaching the task via `task.detach()` or `task.detach_and_log_err(cx)`, allowing it to run indefinitely.
-* Storing the task in a field, if the work should be halted when the struct is dropped.
-
-A task which doesn't do anything but provide a value can be created with `Task::ready(value)`.
-
-## Elements
-
-The `Render` trait is used to render some state into an element tree that is laid out using flexbox layout. An `Entity<T>` where `T` implements `Render` is sometimes called a "view".
-
-Example:
+## 2. Architecture & Data Flow
 
 ```
-struct TextWithBorder(SharedString);
+crates/zed (main binary) ──► gpui::Application ──► gpui_platform::current_platform()
+                                                         │
+                                                         ▼
+                                              gpui_android (Android backend)
+                                              GameActivity + JNI + wgpu + AChoreographer
+                                                         │
+                                              zdroid_runtime (RuntimeProvider trait)
+                                              bootstrap | chroot | external Termux
+                                                         │
+                                                         ▼
+                                              zd-exec (subprocess dispatch)
+```
 
-impl Render for TextWithBorder {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().border_1().child(self.0.clone())
-    }
+- The workspace is a Cargo workspace with ~230 crates under `crates/`, plus `extensions/` and `tooling/`.
+- Default member: `crates/zed` (the main editor binary).
+- **Platform gating**: upstream crates use `#[cfg(target_os = "...")]` and run unchanged. The Android-specific code lives in `crates/gpui_android` and `crates/zdroid_runtime`.
+- `gpui_android` implements the `Platform` / `Window` / `Renderer` traits using GameActivity + JNI + wgpu.
+- `zdroid_runtime` provides the `RuntimeProvider` trait with three adapter implementations.
+- `zd-exec` is a spawn wrapper binary for Android subprocess dispatch.
+- The `.so` is the app process — no JNI bridge per frame, AChoreographer-driven vsync.
+
+## 3. Key Directories
+
+| Path | Purpose |
+|------|---------|
+| `crates/` | All workspace member crates (~230) |
+| `crates/gpui_android/` | Android platform backend (GameActivity, JNI, wgpu, Vulkan) |
+| `crates/zdroid_runtime/` | Runtime provider trait + adapters (bootstrap/chroot/external) |
+| `crates/zed/src/main.rs` | Main editor entry point |
+| `crates/gpui_platform/` | Platform trait abstraction layer |
+| `crates/gpui/` | Core GPUI framework |
+| `crates/editor/` | Main editor with display_map, inlays, git sub-modules |
+| `crates/language/` | Buffer management, syntax highlighting |
+| `crates/project/` | LSP store, git store, worktrees, DAP |
+| `crates/workspace/` | Pane management, workspace orchestration |
+| `crates/terminal/` | Alacritty-based terminal emulator |
+| `crates/vim/` | Full vim modal editing |
+| `crates/agent/` | AI coding assistant |
+| `crates/agent_ui/` | Agent UI components |
+| `crates/opencode/` | Coding assistant core |
+| `crates/collab/` | Collaboration server |
+| `crates/git/` | Git blame, diff, graph |
+| `script/` | Development automation (~85 scripts) |
+| `tooling/xtask/` | Workflow generation (`cargo xtask workflows`), compliance checks |
+| `tooling/compliance/` | License/GitHub API tooling |
+| `tooling/perf/` | Performance benchmarking |
+| `extensions/` | Bundled extensions (glsl, html, proto, test-extension) |
+
+## 4. Development Commands
+
+### Build
+
+Desktop (default member):
+```
+cargo build
+```
+
+Android APK (from project root):
+```
+ANDROID_NDK_HOME=/path/to/ndk/27.0.12077973 \
+  cargo ndk -t arm64-v8a -P 26 -o android/app/src/main/jniLibs build
+cd android && gradle assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.zdroid/.MainActivity
+```
+
+Alternatively, build from the Android example directory:
+```
+cd crates/gpui_android/examples/zed_android
+ANDROID_NDK_HOME=/path/to/ndk/27.0.12077973 \
+  cargo ndk -t arm64-v8a -P 26 -o android/app/src/main/jniLibs build
+cd android && gradle assembleDebug
+```
+
+### Test
+
+```
+cargo test --workspace
+cargo nextest run --workspace --no-fail-fast    # CI runner
+```
+
+### Lint
+
+```
+./script/clippy              # preferred over `cargo clippy`
+cargo fmt --all -- --check
+./script/prettier
+typos --config typos.toml
+```
+
+### CI / Workflow Generation
+
+```
+cargo xtask workflows        # generate CI workflows (gh-workflow crate)
+```
+
+Workflows are generated from `tooling/xtask/src/tasks/workflows.rs` using the `gh-workflow` crate. There is no committed `.github/workflows/` directory — CI is external/upstream.
+
+### Bootstrap
+
+```
+./script/bootstrap           # installs Linux/macOS dev dependencies, minio, sqlx-cli
+```
+
+## 5. Code Conventions & Common Patterns
+
+> **`.rules` at the project root is the authoritative source for per-agent coding guidelines.** Read `.rules` every session. The following summarizes key conventions; see `.rules` for the full detail.
+
+### Rust
+
+- Rust 2024 edition, style_edition 2024 (see `rustfmt.toml`)
+- No `mod.rs` paths — `src/some_module.rs` preferred over `src/some_module/mod.rs`
+- No `unwrap()` — use `?` (error propagation) or `.log_err()` instead
+- Never `let _ = ...` on fallible operations; use `?`, `.log_err()`, or explicit `match`/`if let Err(...)`
+- Full word variable names (no abbreviations like `q` for `queue`)
+- Variable shadowing to scope clones in async contexts (minimizing lifetime of borrowed references)
+- Prefer implementing functionality in existing files; avoid many small files
+- Avoid creative additions unless explicitly requested
+- Prefer `[lib] path = "...rs"` in Cargo.toml for library roots (e.g., `gpui.rs`, `main.rs`)
+
+### GPUI Patterns
+
+- `Entity<T>` for state management, `WeakEntity<T>` for weak handles
+- `cx.spawn(async move |cx| ...)` for foreground async; `cx.background_spawn(...)` for background work
+- `cx.listener()` for event handlers that update the current entity
+- `SharedString` for strings (either `&'static str` or `Arc<str>`)
+- `cx.notify()` to trigger re-render after state changes
+- `cx.emit()` / `cx.subscribe()` for entity events
+- Timers in tests: use `cx.background_executor().timer(duration).await`, never `smol::Timer::after(...)`
+- Element tree conditionals: `.when(condition, ...)` and `.when_some(option, ...)`
+
+### Clippy Restrictions
+
+From `clippy.toml`:
+- `std::process::Command::spawn` / `.output` / `.status` / `.stdin` / `.stdout` / `.stderr` — use `smol::process::Command` instead
+- `smol::Timer::after` in tests — replaced with `gpui::BackgroundExecutor::timer`
+- `serde_json::from_reader` / `serde_json_lenient::from_reader` — use `from_slice` (buffer first)
+
+### PR Hygiene
+
+- Imperative title, correctly capitalized (e.g., `Fix crash in project panel`)
+- No conventional commit prefixes (`fix:`, `feat:`, `docs:`)
+- Optionally prefix with crate name when one crate is the clear scope (e.g., `git_ui: Add history view`)
+- Mandatory `Release Notes:` section as the final section in the PR body
+
+## 6. Major Subsystems
+
+| Subsystem | Key crates | Purpose |
+|-----------|-----------|---------|
+| GPUI Framework | `gpui`, `gpui_macros`, `gpui_platform`, `gpui_android`, `gpui_wgpu`, `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_web`, `gpui_tokio` | GPU-accelerated UI framework with platform-specific backends |
+| Editor Core | `editor` | Main editor with display_map, inlays, multi-buffer, git sub-modules |
+| Language System | `language`, `language_core`, `languages`, `text`, `language_extension` | Buffer management, syntax highlighting, LSP integration |
+| Project System | `project`, `worktree`, `lsp`, `dap` | LSP store, git store, worktree management, debug adapters |
+| Workspace & UI | `workspace`, `ui`, `ui_input`, `picker`, `component`, `sidebar` | Pane management, UI component library, panel system |
+| Collaboration | `collab`, `collab_ui`, `client`, `rpc`, `proto` | Server + client RPC, WebRTC calling, channels |
+| Agent / AI | `agent`, `opencode`, `prompt_store`, `agent_ui`, `agent_skills` | AI coding assistant with tools, templates, skills |
+| LLM Providers | `anthropic`, `open_ai`, `google_ai`, `ollama`, `deepseek`, `mistral`, `bedrock`, `lmstudio`, `x_ai`, `open_router`, `codestral` | Per-provider API clients for LLM integration |
+| Android Runtime | `gpui_android`, `zdroid_runtime` | Android platform backend (GameActivity/JNI/wgpu) + runtime adapter (bootstrap/chroot/external) |
+| Terminal | `terminal`, `terminal_view` | Alacritty-based terminal emulator |
+| Vim Mode | `vim`, `vim_mode_setting` | Full vim modal editing |
+| Git | `git`, `git_ui`, `git_graph`, `git_hosting_providers` | Blame, diff, commit graph, hosting provider integration |
+| Search | `search`, `buffer_diff` | Buffer and project-wide search, streaming diff |
+| Extensions | `extension`, `extension_host`, `extension_api`, `extensions_ui`, `extension_cli` | WASM-based extension system |
+| Settings | `settings`, `settings_ui`, `settings_json`, `settings_macros`, `theme`, `theme_settings` | User settings, themes, persistence |
+| Debugging | `debugger_ui`, `debugger_tools`, `dap`, `dap_adapters`, `debug_adapter_extension` | Debug adapter protocol, debugger UI |
+| Diagnostics | `diagnostics`, `editor` diagnostics | Error/warning squiggles, diagnostics panel |
+| Audio/Video | `audio`, `call`, `livekit_api`, `livekit_client`, `denoise` | WebRTC calling, audio playback |
+| Auto Update | `auto_update`, `auto_update_ui` | In-app update mechanism (desktop) |
+
+## 7. Important Files
+
+| File | Purpose |
+|------|---------|
+| `Cargo.toml` | Workspace definition, dependencies, member list (~230 crates) |
+| `rust-toolchain.toml` | Rust 1.95.0, targets: aarch64-linux-android, wasm32-wasip2, wasm32-unknown-unknown, x86_64-unknown-linux-musl |
+| `rustfmt.toml` | Edition 2024, style_edition 2024 |
+| `clippy.toml` | Disallowed methods/types, interior mutability exemptions |
+| `.rules` | Per-agent coding guidelines — the authoritative source, read every session |
+| `.cargo/config.toml` | rustflags (v0 mangling, tokio_unstable), aliases (xtask, perf-test), Windows-specific flags |
+| `.prettierrc` | printWidth 120 |
+| `crates/zed/src/main.rs` | Main editor entry point |
+| `crates/gpui_android/src/gpui_android.rs` | Android platform backend entry |
+| `crates/zdroid_runtime/src/zdroid_runtime.rs` | Runtime adapter crate root |
+| `.factory/prompts/crash/investigate.md` | Crash investigation prompts (Sentry) |
+| `.factory/prompts/crash/fix.md` | Crash fix prompts |
+
+## 8. Runtime / Tooling Preferences
+
+### Rust
+
+- Channel: `1.95.0` (from `rust-toolchain.toml`)
+- Profile: `minimal`
+- Components: `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`
+- Targets:
+  - `aarch64-linux-android` — Android port
+  - `wasm32-wasip2` — extensions
+  - `wasm32-unknown-unknown` — GPUI on the web
+  - `x86_64-unknown-linux-musl` — remote server
+
+### Build Caching
+
+- `sccache` v0.10.0 with Cloudflare R2 (configured via `script/setup-sccache`)
+- `.cargo/config.toml`: v0 symbol mangling for better backtraces, `tokio_unstable` feature
+
+### Formatters
+
+- `rustfmt` (edition 2024, style_edition 2024)
+- `prettier` (printWidth 120 for code)
+- Full lint suite: `./script/clippy`, `cargo fmt --all -- --check`, `./script/prettier`, `typos`
+
+### CI
+
+- Generated by `cargo xtask workflows` using the `gh-workflow` crate
+- No `.github/workflows/` committed — CI lives externally
+- `./script/clippy` is preferred over `cargo clippy` (it passes `--workspace`, `--release`, `--all-targets`, `--all-features`, `--deny warnings`)
+- Linux docker-based builds via `script/install-linux` and `script/bundle-linux`
+
+## 9. Testing & QA
+
+### Test Frameworks
+
+- **`#[gpui::test]`**: Custom proc-macro for async tests with GPUI lifecycle. Features: seed control, iterations, retries, failure reporting. Test functions receive `&mut TestAppContext`. Runs in GPUI's foreground executor.
+- **`#[gpui::property_test]`**: Property-based testing variant based on proptest. Supports `Arbitrary`-derived strategies, custom `#[strategy = ...]` annotations, and GPUI context parameters. Uses `.no_shrink()` for scheduler seeds.
+- **`#[test]`**: Standard Rust `#[test]` for pure logic without GPUI dependencies.
+
+### Test-Runner Commands
+
+- CI: `cargo nextest run --workspace --no-fail-fast`
+- Local: `cargo test --workspace`
+
+### Gate Patterns
+
+- `#[cfg(feature = "test-support")]` — test-only helper code compiled into the crate
+- `#[cfg(test)]` — inline test modules (standard)
+
+### Key Test Helpers
+
+- `FakeFs` — in-memory filesystem for tests
+- `FakeHttpClient` — mock HTTP client
+- `FakeLanguageModel` — mock language model
+- `Project::test()` — test-harness project factory
+- `SettingsStore::test()` — test-harness settings
+- `VisualTestContext` — window-aware test context
+- `cx.background_executor().timer(duration).await` — GPUI-aware timers
+
+### Environment Variables
+
+- `ITERATIONS` — override test iterations
+- `SEED` — deterministic seed for PRNG-dependent tests
+- `RUST_LOG` — logging level for test output
+
+### Fixture Data
+
+- Marked text with Unicode markers for cursor/selection positions
+- JSON file trees for worktree/project test scenarios
+
+### Typical Test Pattern
+
+```rust
+#[gpui::test]
+async fn test_something(mut cx: &mut TestAppContext) {
+    init_test(&cx);                               // setup logging, settings, etc.
+    let fs = FakeFs::new(cx.background_executor().clone());
+    let project = Project::test(fs, &[], &cx).await;
+    // ... operate ...
+    cx.run_until_parked();                        // advance GPUI scheduler
+    // ... assert ...
 }
 ```
 
-Since `impl IntoElement for SharedString` exists, it can be used as an argument to `child`. `SharedString` is used to avoid copying strings, and is either an `&'static str` or `Arc<str>`.
+## 10. Rules Hygiene
 
-UI components that are constructed just to be turned into elements can instead implement the `RenderOnce` trait, which is similar to `Render`, but its `render` method takes ownership of `self` and receives `&mut App` instead of `&mut Context<Self>`. Types that implement this trait can use `#[derive(IntoElement)]` to use them directly as children.
+See `.rules` for the complete guidelines on maintaining agent rules.
 
-The style methods on elements are similar to those used by Tailwind CSS.
-
-If some attributes or children of an element tree are conditional, `.when(condition, |this| ...)` can be used to run the closure only when `condition` is true. Similarly, `.when_some(option, |this, value| ...)` runs the closure when the `Option` has a value.
-
-## Input events
-
-Input event handlers can be registered on an element via methods like `.on_click(|event, window, cx: &mut App| ...)`.
-
-Often event handlers will want to update the entity that's in the current `Context<T>`. The `cx.listener` method provides this - its use looks like `.on_click(cx.listener(|this: &mut T, event, window, cx: &mut Context<T>| ...)`.
-
-## Actions
-
-Actions are dispatched via user keyboard interaction or in code via `window.dispatch_action(SomeAction.boxed_clone(), cx)` or `focus_handle.dispatch_action(&SomeAction, window, cx)`.
-
-Actions with no data defined with the `actions!(some_namespace, [SomeAction, AnotherAction])` macro call. Otherwise the `Action` derive macro is used. Doc comments on actions are displayed to the user.
-
-Action handlers can be registered on an element via the event handler `.on_action(|action, window, cx| ...)`. Like other event handlers, this is often used with `cx.listener`.
-
-## Notify
-
-When a view's state has changed in a way that may affect its rendering, it should call `cx.notify()`. This will cause the view to be rerendered. It will also cause any observe callbacks registered for the entity with `cx.observe` to be called.
-
-## Entity events
-
-While updating an entity (`cx: Context<T>`), it can emit an event using `cx.emit(event)`. Entities register which events they can emit by declaring `impl EventEmitter<EventType> for EntityType {}`.
-
-Other entities can then register a callback to handle these events by doing `cx.subscribe(other_entity, |this, other_entity, event, cx| ...)`. This will return a `Subscription` which deregisters the callback when dropped.  Typically `cx.subscribe` happens when creating a new entity and the subscriptions are stored in a `_subscriptions: Vec<Subscription>` field.
-
-## Build guidelines
-
-- Use `./script/clippy` instead of `cargo clippy`
-
-# Pull request hygiene
-
-When an agent opens or updates a pull request, it must:
-
-- Use a clear, correctly capitalized, imperative PR title (for example, `Fix crash in project panel`).
-- Avoid conventional commit prefixes in PR titles (`fix:`, `feat:`, `docs:`, etc.).
-- Avoid trailing punctuation in PR titles.
-- Optionally prefix the title with a crate name when one crate is the clear scope (for example, `git_ui: Add history view`).
-- Include a `Release Notes:` section as the final section in the PR body.
-- Use one bullet under `Release Notes:`:
-  - `- Added ...`, `- Fixed ...`, or `- Improved ...` for user-facing changes, or
-  - `- N/A` for docs-only and other non-user-facing changes.
-- Format release notes exactly with a blank line after the heading, for example:
-
-```
-Release Notes:
-
-- N/A
-```
-
-# Crash Investigation
-
-## Sentry Integration
-- Crash investigation prompts: `.factory/prompts/crash/investigate.md`
-- Crash fix prompts: `.factory/prompts/crash/fix.md`
-- Fetch crash reports: `script/sentry-fetch <issue-id>`
-- Generate investigation prompt from crash: `script/crash-to-prompt <issue-id>`
-
-# Rules Hygiene
-
-These `.rules` files are read by every agent session. Keep them high-signal.
-
-## After any agentic session
-If you discover a non-obvious pattern that would help future sessions, include a **"Suggested .rules additions"** heading in your PR description with the proposed text. Do **not** edit `.rules` inline during normal feature/fix work. Reviewers decide what gets merged.
-
-## High bar for new rules
-Editing or clarifying existing rules is always welcome. New rules must meet **all three** criteria:
-1. **Non-obvious** — someone familiar with the codebase would still get it wrong without the rule.
-2. **Repeatedly encountered** — it came up more than once (multiple hits in one session counts).
-3. **Specific enough to act on** — a concrete instruction, not a vague principle.
-
-Rules that apply to a single crate belong in that crate's own `.rules` file, not the repo root.
-
-## What NOT to put in `.rules`
-Avoid architectural descriptions of a crate (module layout, data flow, key types). These go stale fast and the agent can gather them by reading the code. Rules should be **traps to avoid**, not **maps to follow**.
-
-## No drive-by additions
-Rules emerge from validated patterns, not one-off observations. The workflow is:
-1. Agent notes a pattern during a session.
-2. Team validates the pattern in code review.
-3. A dedicated commit adds the rule with context on *why* it exists.
+Key principles:
+- Rules are for **traps to avoid**, not maps to follow
+- High bar for new rules: non-obvious, repeatedly encountered, and specific enough to act on
+- After any agentic session, include a "Suggested .rules additions" heading in PR description with proposed text
+- Do not edit `.rules` inline during normal feature/fix work
+- Single-crate rules belong in that crate's own `.rules` file
+- Avoid architectural descriptions in rules (they go stale fast)
